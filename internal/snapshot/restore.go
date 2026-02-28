@@ -147,66 +147,16 @@ func (s *AWSSnapshotter) RestoreSnapshot(ctx context.Context) (*RestoreSnapshotO
 	var newVolume *types.Volume
 	var volumeIsNewAndUnformatted bool
 
-	filters := []types.Filter{
-		{Name: aws.String("status"), Values: []string{string(types.SnapshotStateCompleted)}},
-	}
-	for _, tag := range s.defaultTags() {
-		filters = append(filters, types.Filter{Name: aws.String(fmt.Sprintf("tag:%s", *tag.Key)), Values: []string{*tag.Value}})
-	}
-	// Also match legacy snapshots created with path=_all_ before suffix-aware path tags
-	if s.config.Suffix != "" {
-		pathFilterName := fmt.Sprintf("tag:%s", snapshotTagKeyPath)
-		for i, f := range filters {
-			if *f.Name == pathFilterName {
-				filters[i].Values = append(filters[i].Values, "_all_")
-				break
-			}
-		}
-	}
-	s.logger.Info().Msgf("RestoreSnapshot: Searching for the latest snapshot for branch: %s and filters: %s", gitBranch, utils.PrettyPrint(filters))
-	snapshotsOutput, err := s.ec2Client.DescribeSnapshots(ctx, &ec2.DescribeSnapshotsInput{
-		Filters:  filters,
-		OwnerIds: []string{"self"},
-	})
-	if err != nil {
-		return nil, fmt.Errorf("failed to describe snapshots for branch %s: %w", gitBranch, err)
+	latestSnapshot := s.findSnapshot(ctx, gitBranch)
+
+	// Cross-suffix fallback: any snapshot from the same repo is better than a blank volume
+	if latestSnapshot == nil && s.config.Suffix != "" {
+		s.logger.Info().Msgf("RestoreSnapshot: No snapshot found for suffix %q, trying any suffix as fallback", s.config.Suffix)
+		latestSnapshot = s.findSnapshotAnySuffix(ctx, gitBranch)
 	}
 
-	var latestSnapshot *types.Snapshot
-	if len(snapshotsOutput.Snapshots) > 0 {
-		latestSnapshot = &snapshotsOutput.Snapshots[0]
-		for _, snap := range snapshotsOutput.Snapshots {
-			if snapTime := snap.StartTime; snapTime.After(*latestSnapshot.StartTime) {
-				latestSnapshot = &snap
-			}
-		}
-		s.logger.Info().Msgf("RestoreSnapshot: Found latest snapshot %s for branch %s", *latestSnapshot.SnapshotId, gitBranch)
-	} else if s.config.RunnerConfig.DefaultBranch != "" {
-		if err := replaceFilterValues(filters, "tag:"+snapshotTagKeyBranch, []string{s.getSnapshotTagValueDefaultBranch()}); err != nil {
-			return nil, fmt.Errorf("failed to find default branch filter: %w", err)
-		}
-
-		s.logger.Info().Msgf("RestoreSnapshot: No snapshot found for branch %s, trying default branch %s", gitBranch, s.config.RunnerConfig.DefaultBranch)
-
-		defaultBranchSnapshotsOutput, err := s.ec2Client.DescribeSnapshots(ctx, &ec2.DescribeSnapshotsInput{
-			Filters:  filters,
-			OwnerIds: []string{"self"},
-		})
-		if err != nil {
-			return nil, fmt.Errorf("failed to describe snapshots for default branch %s: %w", s.config.RunnerConfig.DefaultBranch, err)
-		}
-
-		if len(defaultBranchSnapshotsOutput.Snapshots) > 0 {
-			latestSnapshot = &defaultBranchSnapshotsOutput.Snapshots[0]
-			for _, snap := range defaultBranchSnapshotsOutput.Snapshots {
-				if snapTime := snap.StartTime; snapTime.After(*latestSnapshot.StartTime) {
-					latestSnapshot = &snap
-				}
-			}
-			s.logger.Info().Msgf("RestoreSnapshot: Found latest snapshot %s from default branch %s", *latestSnapshot.SnapshotId, s.config.RunnerConfig.DefaultBranch)
-		} else {
-			s.logger.Info().Msgf("RestoreSnapshot: No existing snapshot found. A new volume will be created.")
-		}
+	if latestSnapshot == nil {
+		s.logger.Info().Msgf("RestoreSnapshot: No existing snapshot found. A new volume will be created.")
 	}
 
 	commonVolumeTags := append(s.defaultTags(), []types.Tag{
@@ -367,6 +317,114 @@ func (s *AWSSnapshotter) RestoreSnapshot(ctx context.Context) (*RestoreSnapshotO
 		DeviceName: actualDeviceName,
 		NewVolume:  volumeIsNewAndUnformatted,
 	}, nil
+}
+
+// buildFilters creates the default AWS snapshot search filters.
+// If a suffix is set, the path filter includes both the suffix-aware and legacy _all_ values.
+func (s *AWSSnapshotter) buildFilters() []types.Filter {
+	filters := []types.Filter{
+		{Name: aws.String("status"), Values: []string{string(types.SnapshotStateCompleted)}},
+	}
+	for _, tag := range s.defaultTags() {
+		filters = append(filters, types.Filter{Name: aws.String(fmt.Sprintf("tag:%s", *tag.Key)), Values: []string{*tag.Value}})
+	}
+	if s.config.Suffix != "" {
+		pathFilterName := fmt.Sprintf("tag:%s", snapshotTagKeyPath)
+		for i, f := range filters {
+			if *f.Name == pathFilterName {
+				filters[i].Values = append(filters[i].Values, "_all_")
+				break
+			}
+		}
+	}
+	return filters
+}
+
+// findLatestSnapshot returns the newest snapshot from a DescribeSnapshots response, or nil.
+func findLatestSnapshot(snapshots []types.Snapshot) *types.Snapshot {
+	if len(snapshots) == 0 {
+		return nil
+	}
+	latest := &snapshots[0]
+	for i := range snapshots {
+		if snapshots[i].StartTime.After(*latest.StartTime) {
+			latest = &snapshots[i]
+		}
+	}
+	return latest
+}
+
+// searchSnapshots runs DescribeSnapshots with the given filters and returns the latest match.
+func (s *AWSSnapshotter) searchSnapshots(ctx context.Context, filters []types.Filter) *types.Snapshot {
+	output, err := s.ec2Client.DescribeSnapshots(ctx, &ec2.DescribeSnapshotsInput{
+		Filters:  filters,
+		OwnerIds: []string{"self"},
+	})
+	if err != nil {
+		s.logger.Warn().Msgf("DescribeSnapshots failed: %v", err)
+		return nil
+	}
+	return findLatestSnapshot(output.Snapshots)
+}
+
+// findSnapshot searches for a snapshot matching the exact suffix, trying the given branch then the default branch.
+func (s *AWSSnapshotter) findSnapshot(ctx context.Context, branch string) *types.Snapshot {
+	filters := s.buildFilters()
+
+	s.logger.Info().Msgf("RestoreSnapshot: Searching for snapshot (branch=%s, suffix=%s)", branch, s.config.Suffix)
+	if snap := s.searchSnapshots(ctx, filters); snap != nil {
+		s.logger.Info().Msgf("RestoreSnapshot: Found snapshot %s for branch %s", *snap.SnapshotId, branch)
+		return snap
+	}
+
+	if s.config.RunnerConfig.DefaultBranch != "" {
+		s.logger.Info().Msgf("RestoreSnapshot: No snapshot found for branch %s, trying default branch %s", branch, s.config.RunnerConfig.DefaultBranch)
+		if err := replaceFilterValues(filters, "tag:"+snapshotTagKeyBranch, []string{s.getSnapshotTagValueDefaultBranch()}); err != nil {
+			s.logger.Warn().Msgf("Failed to update branch filter: %v", err)
+			return nil
+		}
+		if snap := s.searchSnapshots(ctx, filters); snap != nil {
+			s.logger.Info().Msgf("RestoreSnapshot: Found snapshot %s from default branch %s", *snap.SnapshotId, s.config.RunnerConfig.DefaultBranch)
+			return snap
+		}
+	}
+
+	return nil
+}
+
+// findSnapshotAnySuffix searches for any snapshot from the same repo, ignoring suffix/path tags.
+// Used as a last-resort fallback when no suffix-specific snapshot exists.
+func (s *AWSSnapshotter) findSnapshotAnySuffix(ctx context.Context, branch string) *types.Snapshot {
+	filters := []types.Filter{
+		{Name: aws.String("status"), Values: []string{string(types.SnapshotStateCompleted)}},
+	}
+	for _, tag := range s.defaultTags() {
+		key := *tag.Key
+		if key == snapshotTagKeyPath || key == snapshotTagKeySuffix {
+			continue
+		}
+		filters = append(filters, types.Filter{Name: aws.String(fmt.Sprintf("tag:%s", key)), Values: []string{*tag.Value}})
+	}
+
+	s.logger.Info().Msgf("RestoreSnapshot: Cross-suffix fallback search (branch=%s)", branch)
+	if snap := s.searchSnapshots(ctx, filters); snap != nil {
+		s.logger.Info().Msgf("RestoreSnapshot: Found cross-suffix snapshot %s for branch %s", *snap.SnapshotId, branch)
+		return snap
+	}
+
+	if s.config.RunnerConfig.DefaultBranch != "" {
+		s.logger.Info().Msgf("RestoreSnapshot: Cross-suffix fallback, trying default branch %s", s.config.RunnerConfig.DefaultBranch)
+		if err := replaceFilterValues(filters, "tag:"+snapshotTagKeyBranch, []string{s.getSnapshotTagValueDefaultBranch()}); err != nil {
+			s.logger.Warn().Msgf("Failed to update branch filter: %v", err)
+			return nil
+		}
+		if snap := s.searchSnapshots(ctx, filters); snap != nil {
+			s.logger.Info().Msgf("RestoreSnapshot: Found cross-suffix snapshot %s from default branch %s", *snap.SnapshotId, s.config.RunnerConfig.DefaultBranch)
+			return snap
+		}
+	}
+
+	return nil
 }
 
 func replaceFilterValues(filters []types.Filter, name string, values []string) error {
