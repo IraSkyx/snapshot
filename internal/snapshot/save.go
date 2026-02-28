@@ -85,14 +85,11 @@ func (s *AWSSnapshotter) CreateSnapshot(ctx context.Context) (*CreateSnapshotOut
 	newSnapshotID := *createSnapshotOutput.SnapshotId
 	s.logger.Info().Msgf("CreateSnapshot: Snapshot %s creation initiated.", newSnapshotID)
 
-	if volumeInfo.NewVolume {
-		s.logger.Info().Msgf("CreateSnapshot: Initial snapshot from new volume, waiting for completion...")
-	} else if s.config.WaitForCompletion {
-		s.logger.Info().Msgf("CreateSnapshot: Waiting for snapshot completion (wait_for_completion=true)...")
-	} else {
+	if !s.config.WaitForCompletion {
 		s.logger.Info().Msgf("CreateSnapshot: Snapshot initiated, volume %s left attached for warm reuse.", volumeInfo.VolumeID)
 		return &CreateSnapshotOutput{SnapshotID: newSnapshotID}, nil
 	}
+	s.logger.Info().Msgf("CreateSnapshot: Waiting for snapshot completion (wait_for_completion=true)...")
 
 	snapshotCompletedWaiter := ec2.NewSnapshotCompletedWaiter(s.ec2Client, defaultSnapshotCompletedWaiterOptions)
 	if err := snapshotCompletedWaiter.Wait(ctx, &ec2.DescribeSnapshotsInput{SnapshotIds: []string{newSnapshotID}}, defaultSnapshotCompletedMaxWaitTime); err != nil {
