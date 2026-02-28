@@ -26,11 +26,11 @@ const (
 	snapshotTagKeyBranch     = "runs-on-snapshot-branch"
 	snapshotTagKeyRepository = "runs-on-snapshot-repository"
 	snapshotTagKeyVersion    = "runs-on-snapshot-version"
+	snapshotTagKeyPath       = "runs-on-snapshot-path"
 	nameTagKey               = "Name"
 	timestampTagKey          = "runs-on-timestamp"
 	ttlTagKey                = "runs-on-delete-after"
 
-	suggestedDeviceName                 = "/dev/sdf" // AWS might assign /dev/xvdf etc.
 	defaultVolumeInUseMaxWaitTime       = 5 * time.Minute
 	defaultVolumeAvailableMaxWaitTime   = 5 * time.Minute
 	defaultSnapshotCompletedMaxWaitTime = 10 * time.Minute
@@ -49,6 +49,14 @@ var defaultVolumeInUseWaiterOptions = func(o *ec2.VolumeInUseWaiterOptions) {
 var defaultVolumeAvailableWaiterOptions = func(o *ec2.VolumeAvailableWaiterOptions) {
 	o.MaxDelay = 3 * time.Second
 	o.MinDelay = 3 * time.Second
+}
+
+func suggestedDeviceNameForIndex(index int) string {
+	return fmt.Sprintf("/dev/sd%c", 'f'+rune(index))
+}
+
+func sanitizePath(path string) string {
+	return strings.Trim(strings.ReplaceAll(path, "/", "-"), "-")
 }
 
 // Snapshotter interface from the original file - kept for reference
@@ -129,13 +137,18 @@ func NewAWSSnapshotter(ctx context.Context, logger *zerolog.Logger, cfg *runsOnC
 		sanitizedGithubRef = sanitizedGithubRef[:40]
 	}
 
+	sanitizedPath := sanitizePath(cfg.Path)
+	if len(sanitizedPath) > 30 {
+		sanitizedPath = sanitizedPath[:30]
+	}
+
 	currentTime := time.Now()
 	if cfg.SnapshotName == "" {
-		cfg.SnapshotName = fmt.Sprintf("runs-on-snapshot-%s-%s", sanitizedGithubRef, currentTime.Format("20060102-150405"))
+		cfg.SnapshotName = fmt.Sprintf("runs-on-snapshot-%s-%s-%s", sanitizedPath, sanitizedGithubRef, currentTime.Format("20060102-150405"))
 	}
 
 	if cfg.VolumeName == "" {
-		cfg.VolumeName = fmt.Sprintf("runs-on-volume-%s-%s", sanitizedGithubRef, currentTime.Format("20060102-150405"))
+		cfg.VolumeName = fmt.Sprintf("runs-on-volume-%s-%s-%s", sanitizedPath, sanitizedGithubRef, currentTime.Format("20060102-150405"))
 	}
 
 	return &AWSSnapshotter{
@@ -160,6 +173,7 @@ func (s *AWSSnapshotter) defaultTags() []types.Tag {
 		{Key: aws.String(snapshotTagKeyBranch), Value: aws.String(s.getSnapshotTagValue())},
 		{Key: aws.String(snapshotTagKeyArch), Value: aws.String(s.arch())},
 		{Key: aws.String(snapshotTagKeyPlatform), Value: aws.String(s.platform())},
+		{Key: aws.String(snapshotTagKeyPath), Value: aws.String(sanitizePath(s.config.Path))},
 	}
 	for _, tag := range s.config.CustomTags {
 		tags = append(tags, types.Tag{Key: aws.String(tag.Key), Value: aws.String(tag.Value)})

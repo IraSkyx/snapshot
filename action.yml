@@ -9,7 +9,7 @@ runs:
 
 inputs:
   path:
-    description: 'Path to the directory to snapshot. Must be an absolute path.'
+    description: 'Path(s) to the directories to snapshot. Must be absolute paths. Use newlines to specify multiple paths, each will get its own EBS volume and snapshot.'
     required: true
   version:
     description: 'Version of the snapshot to use'

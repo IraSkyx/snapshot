@@ -15,20 +15,20 @@ import (
 func handleMainExecution(action *githubactions.Action, ctx context.Context, logger *zerolog.Logger) {
 	cfg := config.NewConfigFromInputs(action)
 
-	if cfg.Path != "" {
-		action.Infof("Restoring volume for %s...", cfg.Path)
-		snapshotter, err := snapshot.NewAWSSnapshotter(ctx, logger, cfg)
+	for i, path := range cfg.Paths {
+		pathCfg := cfg.ForPath(i)
+		action.Infof("Restoring volume for %s (%d/%d)...", path, i+1, len(cfg.Paths))
+		snapshotter, err := snapshot.NewAWSSnapshotter(ctx, logger, pathCfg)
 		if err != nil {
-			action.Errorf("Failed to create snapshotter: %v", err)
-		} else {
-			action.Infof("Creating snapshot for %s", cfg.Path)
-			snapshotOutput, err := snapshotter.RestoreSnapshot(ctx, cfg.Path)
-			if err != nil {
-				action.Errorf("Failed to restore snapshot for %s: %v", cfg.Path, err)
-			} else {
-				action.Infof("Snapshot restored into volume %s", snapshotOutput.VolumeID)
-			}
+			action.Errorf("Failed to create snapshotter for %s: %v", path, err)
+			continue
 		}
+		snapshotOutput, err := snapshotter.RestoreSnapshot(ctx, path)
+		if err != nil {
+			action.Errorf("Failed to restore snapshot for %s: %v", path, err)
+			continue
+		}
+		action.Infof("Snapshot restored into volume %s for %s", snapshotOutput.VolumeID, path)
 	}
 
 	action.Infof("Action finished.")
@@ -45,19 +45,20 @@ func handlePostExecution(action *githubactions.Action, ctx context.Context, logg
 		return
 	}
 
-	if cfg.Path != "" {
-		action.Infof("Snapshotting volume for %s...", cfg.Path)
-		snapshotter, err := snapshot.NewAWSSnapshotter(ctx, logger, cfg)
+	for i, path := range cfg.Paths {
+		pathCfg := cfg.ForPath(i)
+		action.Infof("Snapshotting volume for %s (%d/%d)...", path, i+1, len(cfg.Paths))
+		snapshotter, err := snapshot.NewAWSSnapshotter(ctx, logger, pathCfg)
 		if err != nil {
-			action.Errorf("Failed to create snapshotter: %v", err)
-		} else {
-			snapshot, err := snapshotter.CreateSnapshot(ctx, cfg.Path)
-			if err != nil {
-				action.Errorf("Failed to snapshot volumes: %v", err)
-			} else {
-				action.Infof("Snapshot created: %s. Note that it might take a few minutes to be available for use.", snapshot.SnapshotID)
-			}
+			action.Errorf("Failed to create snapshotter for %s: %v", path, err)
+			continue
 		}
+		snap, err := snapshotter.CreateSnapshot(ctx, path)
+		if err != nil {
+			action.Errorf("Failed to snapshot volume for %s: %v", path, err)
+			continue
+		}
+		action.Infof("Snapshot created for %s: %s. Note that it might take a few minutes to be available for use.", path, snap.SnapshotID)
 	}
 	action.Infof("Post-execution phase finished.")
 }

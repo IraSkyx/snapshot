@@ -15,7 +15,9 @@ import (
 const requiredTagKey = "runs-on-stack-name"
 
 type Config struct {
+	Paths                    []string
 	Path                     string
+	DeviceIndex              int
 	Version                  string
 	WaitForCompletion        bool
 	Save                     bool
@@ -81,15 +83,20 @@ func NewConfigFromInputs(action *githubactions.Action) *Config {
 		action.Fatalf("Required tag '%s' is not present in the RunsOn config file.", requiredTagKey)
 	}
 
-	path := action.GetInput("path")
-	path = strings.TrimSpace(path)
-	if path == "" {
-		action.Fatalf("Path is required.")
+	pathInput := action.GetInput("path")
+	for _, p := range strings.Split(pathInput, "\n") {
+		p = strings.TrimSpace(p)
+		if p == "" {
+			continue
+		}
+		if !strings.HasPrefix(p, "/") {
+			action.Fatalf("Path '%s' must be an absolute path.", p)
+		}
+		cfg.Paths = append(cfg.Paths, p)
 	}
-	if !strings.HasPrefix(path, "/") {
-		action.Fatalf("Path '%s' must be an absolute path.", path)
+	if len(cfg.Paths) == 0 {
+		action.Fatalf("At least one path is required.")
 	}
-	cfg.Path = path
 
 	cfg.Version = action.GetInput("version")
 	if cfg.Version == "" {
@@ -110,11 +117,22 @@ func NewConfigFromInputs(action *githubactions.Action) *Config {
 	cfg.VolumeThroughput = parseInt(action, "volume_throughput", 100, 0)
 	cfg.VolumeSize = parseInt(action, "volume_size", 1, 0)
 
-	action.Infof("Input 'path': %v", cfg.Path)
+	action.Infof("Input 'path': %v", cfg.Paths)
 	action.Infof("Input 'version': %s", cfg.Version)
 	action.Infof("Input 'wait_for_completion': %t", cfg.WaitForCompletion)
 
 	return cfg
+}
+
+// ForPath returns a copy of the config scoped to a single path at the given index.
+// SnapshotName and VolumeName are cleared so the snapshotter generates path-specific names.
+func (c *Config) ForPath(index int) *Config {
+	cp := *c
+	cp.Path = c.Paths[index]
+	cp.DeviceIndex = index
+	cp.SnapshotName = ""
+	cp.VolumeName = ""
+	return &cp
 }
 
 func parseInt(action *githubactions.Action, input string, min int, max int) int32 {

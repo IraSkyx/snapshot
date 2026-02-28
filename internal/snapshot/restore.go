@@ -3,6 +3,7 @@ package snapshot
 import (
 	"context"
 	"fmt"
+	"os"
 	"strings"
 	"time"
 
@@ -161,9 +162,10 @@ func (s *AWSSnapshotter) RestoreSnapshot(ctx context.Context, mountPoint string)
 	s.logger.Info().Msgf("RestoreSnapshot: Volume %s is available.", *newVolume.VolumeId)
 
 	// 5. Attach Volume
-	s.logger.Info().Msgf("RestoreSnapshot: Attaching volume %s to instance %s as %s", *newVolume.VolumeId, s.config.InstanceID, suggestedDeviceName)
+	suggestedDevice := suggestedDeviceNameForIndex(s.config.DeviceIndex)
+	s.logger.Info().Msgf("RestoreSnapshot: Attaching volume %s to instance %s as %s", *newVolume.VolumeId, s.config.InstanceID, suggestedDevice)
 	attachOutput, err := s.ec2Client.AttachVolume(ctx, &ec2.AttachVolumeInput{
-		Device:     aws.String(suggestedDeviceName),
+		Device:     aws.String(suggestedDevice),
 		InstanceId: aws.String(s.config.InstanceID),
 		VolumeId:   newVolume.VolumeId,
 	})
@@ -224,7 +226,7 @@ func (s *AWSSnapshotter) RestoreSnapshot(ctx context.Context, mountPoint string)
 		fields := strings.SplitN(line, " ", 2)
 		s.logger.Info().Msgf("RestoreSnapshot: fields: %v", fields)
 		// first volume is the root volume, so we need to skip it
-		if len(fields) > 1 && fields[1] == "Amazon Elastic Block Store" {
+		if len(fields) > 1 && strings.TrimSpace(fields[1]) == "Amazon Elastic Block Store" {
 			s.logger.Info().Msgf("RestoreSnapshot: Found volume: %s", fields[0])
 			actualDeviceName = fields[0]
 		}
@@ -260,6 +262,15 @@ func (s *AWSSnapshotter) RestoreSnapshot(ctx context.Context, mountPoint string)
 		return nil, fmt.Errorf("failed to mount %s to %s: %w", actualDeviceName, mountPoint, err)
 	}
 	s.logger.Info().Msgf("RestoreSnapshot: Device %s mounted to %s.", actualDeviceName, mountPoint)
+
+	if !strings.HasPrefix(mountPoint, "/var/lib/docker") {
+		if sudoUser := os.Getenv("SUDO_USER"); sudoUser != "" {
+			s.logger.Info().Msgf("RestoreSnapshot: Fixing ownership of %s for user %s...", mountPoint, sudoUser)
+			if _, err := s.runCommand(ctx, "sudo", "chown", "-R", sudoUser+":"+sudoUser, mountPoint); err != nil {
+				s.logger.Warn().Msgf("RestoreSnapshot: failed to chown %s to %s: %v", mountPoint, sudoUser, err)
+			}
+		}
+	}
 
 	if strings.HasPrefix(mountPoint, "/var/lib/docker") {
 		s.logger.Info().Msgf("RestoreSnapshot: Starting docker service...")
