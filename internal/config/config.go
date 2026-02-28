@@ -16,6 +16,7 @@ const requiredTagKey = "runs-on-stack-name"
 
 type Config struct {
 	Paths                    []string
+	Suffix                   string
 	Version                  string
 	WaitForCompletion        bool
 	Save                     bool
@@ -95,6 +96,8 @@ func NewConfigFromInputs(action *githubactions.Action) *Config {
 	if len(cfg.Paths) == 0 {
 		action.Fatalf("At least one path is required.")
 	}
+
+	cfg.Suffix = action.GetInput("suffix")
 
 	cfg.Version = action.GetInput("version")
 	if cfg.Version == "" {

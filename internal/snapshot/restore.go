@@ -17,15 +17,15 @@ import (
 	"github.com/runs-on/snapshot/internal/utils"
 )
 
-func subDirForPath(path string) string {
-	return filepath.Join(baseMountPoint, sanitizePath(path))
+func (s *AWSSnapshotter) subDirForPath(path string) string {
+	return filepath.Join(s.baseMountPoint(), sanitizePath(path))
 }
 
 // setupBindMounts creates subdirectories on the EBS volume and bind-mounts them to each target path.
 func (s *AWSSnapshotter) setupBindMounts(ctx context.Context) error {
 	for _, path := range s.config.Paths {
 		isDocker := strings.HasPrefix(path, "/var/lib/docker")
-		subDir := subDirForPath(path)
+		subDir := s.subDirForPath(path)
 
 		if isDocker {
 			if _, err := s.runCommand(ctx, "sudo", "systemctl", "stop", "docker"); err != nil {
@@ -98,11 +98,12 @@ func (s *AWSSnapshotter) tryWarmRestore(ctx context.Context) (*RestoreSnapshotOu
 
 	s.logger.Info().Msgf("RestoreSnapshot: Warm volume %s detected, reusing (skipping create/attach)...", volumeInfo.VolumeID)
 
-	if _, err := s.runCommand(ctx, "mountpoint", "-q", baseMountPoint); err != nil {
-		if _, err := s.runCommand(ctx, "sudo", "mkdir", "-p", baseMountPoint); err != nil {
+	bmp := s.baseMountPoint()
+	if _, err := s.runCommand(ctx, "mountpoint", "-q", bmp); err != nil {
+		if _, err := s.runCommand(ctx, "sudo", "mkdir", "-p", bmp); err != nil {
 			return nil, fmt.Errorf("failed to create base mount point: %w", err)
 		}
-		if _, err := s.runCommand(ctx, "sudo", "mount", volumeInfo.DeviceName, baseMountPoint); err != nil {
+		if _, err := s.runCommand(ctx, "sudo", "mount", volumeInfo.DeviceName, bmp); err != nil {
 			s.logger.Warn().Msgf("Warm base mount failed (%v), detaching stale volume %s", err, volumeInfo.VolumeID)
 			s.ec2Client.DetachVolume(ctx, &ec2.DetachVolumeInput{
 				VolumeId:   aws.String(volumeInfo.VolumeID),
@@ -327,18 +328,19 @@ func (s *AWSSnapshotter) RestoreSnapshot(ctx context.Context) (*RestoreSnapshotO
 		}
 	}
 
-	if _, err = s.runCommand(ctx, "sudo", "mkdir", "-p", baseMountPoint); err != nil {
+	bmp := s.baseMountPoint()
+	if _, err = s.runCommand(ctx, "sudo", "mkdir", "-p", bmp); err != nil {
 		return nil, fmt.Errorf("failed to create base mount point: %w", err)
 	}
-	if _, err = s.runCommand(ctx, "sudo", "mount", actualDeviceName, baseMountPoint); err != nil {
-		return nil, fmt.Errorf("failed to mount %s at %s: %w", actualDeviceName, baseMountPoint, err)
+	if _, err = s.runCommand(ctx, "sudo", "mount", actualDeviceName, bmp); err != nil {
+		return nil, fmt.Errorf("failed to mount %s at %s: %w", actualDeviceName, bmp, err)
 	}
-	s.logger.Info().Msgf("RestoreSnapshot: Volume mounted at %s", baseMountPoint)
+	s.logger.Info().Msgf("RestoreSnapshot: Volume mounted at %s", bmp)
 
 	volumeInfo := &VolumeInfo{
 		VolumeID:   *newVolume.VolumeId,
 		DeviceName: actualDeviceName,
-		MountPoint: baseMountPoint,
+		MountPoint: bmp,
 		NewVolume:  volumeIsNewAndUnformatted,
 	}
 	if saveErr := s.saveVolumeInfo(volumeInfo); saveErr != nil {

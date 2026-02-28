@@ -44,13 +44,14 @@ func (s *AWSSnapshotter) CreateSnapshot(ctx context.Context) (*CreateSnapshotOut
 	}
 
 	// Unmount base volume for filesystem consistency
-	s.logger.Info().Msgf("CreateSnapshot: Unmounting base volume at %s...", baseMountPoint)
-	if _, err := s.runCommand(ctx, "sudo", "umount", baseMountPoint); err != nil {
-		dfOutput, checkErr := s.runCommand(ctx, "df", baseMountPoint)
-		if checkErr == nil && strings.Contains(string(dfOutput), baseMountPoint) {
-			return nil, fmt.Errorf("failed to unmount base volume %s: %w. Output: %s", baseMountPoint, err, string(dfOutput))
+	bmp := s.baseMountPoint()
+	s.logger.Info().Msgf("CreateSnapshot: Unmounting base volume at %s...", bmp)
+	if _, err := s.runCommand(ctx, "sudo", "umount", bmp); err != nil {
+		dfOutput, checkErr := s.runCommand(ctx, "df", bmp)
+		if checkErr == nil && strings.Contains(string(dfOutput), bmp) {
+			return nil, fmt.Errorf("failed to unmount base volume %s: %w. Output: %s", bmp, err, string(dfOutput))
 		}
-		s.logger.Warn().Msgf("Unmount of %s failed but seems not mounted: %v", baseMountPoint, err)
+		s.logger.Warn().Msgf("Unmount of %s failed but seems not mounted: %v", bmp, err)
 	}
 
 	// Extend TTL for warm pool reuse

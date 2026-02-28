@@ -26,12 +26,13 @@ const (
 	snapshotTagKeyRepository = "runs-on-snapshot-repository"
 	snapshotTagKeyVersion    = "runs-on-snapshot-version"
 	snapshotTagKeyPath       = "runs-on-snapshot-path"
+	snapshotTagKeySuffix     = "runs-on-snapshot-suffix"
 	nameTagKey               = "Name"
 	timestampTagKey          = "runs-on-timestamp"
 	ttlTagKey                = "runs-on-delete-after"
 
-	baseMountPoint    = "/mnt/runs-on-snapshot"
-	suggestedDeviceName = "/dev/sdf"
+	defaultBaseMountPoint = "/mnt/runs-on-snapshot"
+	suggestedDeviceName  = "/dev/sdf"
 
 	defaultVolumeInUseMaxWaitTime       = 5 * time.Minute
 	defaultVolumeAvailableMaxWaitTime   = 5 * time.Minute
@@ -126,12 +127,16 @@ func NewAWSSnapshotter(ctx context.Context, logger *zerolog.Logger, cfg *runsOnC
 	}
 
 	currentTime := time.Now()
+	suffixPart := ""
+	if cfg.Suffix != "" {
+		suffixPart = "-" + cfg.Suffix
+	}
 	if cfg.SnapshotName == "" {
-		cfg.SnapshotName = fmt.Sprintf("runs-on-snapshot-%s-%s", sanitizedGithubRef, currentTime.Format("20060102-150405"))
+		cfg.SnapshotName = fmt.Sprintf("runs-on-snapshot%s-%s-%s", suffixPart, sanitizedGithubRef, currentTime.Format("20060102-150405"))
 	}
 
 	if cfg.VolumeName == "" {
-		cfg.VolumeName = fmt.Sprintf("runs-on-volume-%s-%s", sanitizedGithubRef, currentTime.Format("20060102-150405"))
+		cfg.VolumeName = fmt.Sprintf("runs-on-volume%s-%s-%s", suffixPart, sanitizedGithubRef, currentTime.Format("20060102-150405"))
 	}
 
 	return &AWSSnapshotter{
@@ -149,6 +154,20 @@ func (s *AWSSnapshotter) platform() string {
 	return runtime.GOOS
 }
 
+func (s *AWSSnapshotter) baseMountPoint() string {
+	if s.config.Suffix == "" {
+		return defaultBaseMountPoint
+	}
+	return fmt.Sprintf("%s-%s", defaultBaseMountPoint, s.config.Suffix)
+}
+
+func (s *AWSSnapshotter) volumeInfoPath() string {
+	if s.config.Suffix == "" {
+		return filepath.Join("/runs-on", "snapshot.json")
+	}
+	return filepath.Join("/runs-on", fmt.Sprintf("snapshot-%s.json", s.config.Suffix))
+}
+
 func (s *AWSSnapshotter) defaultTags() []types.Tag {
 	tags := []types.Tag{
 		{Key: aws.String(snapshotTagKeyVersion), Value: aws.String(s.config.Version)},
@@ -157,6 +176,7 @@ func (s *AWSSnapshotter) defaultTags() []types.Tag {
 		{Key: aws.String(snapshotTagKeyArch), Value: aws.String(s.arch())},
 		{Key: aws.String(snapshotTagKeyPlatform), Value: aws.String(s.platform())},
 		{Key: aws.String(snapshotTagKeyPath), Value: aws.String("_all_")},
+		{Key: aws.String(snapshotTagKeySuffix), Value: aws.String(s.config.Suffix)},
 	}
 	for _, tag := range s.config.CustomTags {
 		tags = append(tags, types.Tag{Key: aws.String(tag.Key), Value: aws.String(tag.Value)})
@@ -165,7 +185,7 @@ func (s *AWSSnapshotter) defaultTags() []types.Tag {
 }
 
 func (s *AWSSnapshotter) saveVolumeInfo(volumeInfo *VolumeInfo) error {
-	infoPath := getVolumeInfoPath()
+	infoPath := s.volumeInfoPath()
 
 	if err := os.MkdirAll(filepath.Dir(infoPath), 0755); err != nil {
 		return fmt.Errorf("failed to create directory for volume info: %w", err)
@@ -184,7 +204,7 @@ func (s *AWSSnapshotter) saveVolumeInfo(volumeInfo *VolumeInfo) error {
 }
 
 func (s *AWSSnapshotter) loadVolumeInfo() (*VolumeInfo, error) {
-	infoPath := getVolumeInfoPath()
+	infoPath := s.volumeInfoPath()
 	data, err := os.ReadFile(infoPath)
 	if err != nil {
 		return nil, fmt.Errorf("failed to read volume info file: %w", err)
@@ -222,6 +242,3 @@ func (s *AWSSnapshotter) runCommand(ctx context.Context, name string, arg ...str
 	return output, nil
 }
 
-func getVolumeInfoPath() string {
-	return filepath.Join("/runs-on", "snapshot.json")
-}

@@ -43,3 +43,7 @@ inputs:
     description: 'Save the volume in the post step. When false, the volume is not saved.'
     required: false
     default: 'true'
+  suffix:
+    description: 'Optional suffix to isolate snapshots between different jobs on the same branch (e.g. "lint", "build", "tests"). Jobs with different suffixes get independent caches.'
+    required: false
+    default: ''
