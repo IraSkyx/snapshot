@@ -321,7 +321,7 @@ func (s *AWSSnapshotter) RestoreSnapshot(ctx context.Context) (*RestoreSnapshotO
 
 	if volumeIsNewAndUnformatted {
 		s.logger.Info().Msgf("RestoreSnapshot: Formatting new volume with ext4...")
-		if _, fmtErr := s.runCommand(ctx, "sudo", "mkfs.ext4", "-F", actualDeviceName); fmtErr != nil {
+		if _, fmtErr := s.runCommand(ctx, "sudo", "mkfs.ext4", "-F", "-E", "lazy_itable_init=1,lazy_journal_init=1", actualDeviceName); fmtErr != nil {
 			err = fmt.Errorf("failed to format device %s: %w", actualDeviceName, fmtErr)
 			return nil, err
 		}
