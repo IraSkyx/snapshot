@@ -13,12 +13,92 @@ import (
 	"github.com/runs-on/snapshot/internal/utils"
 )
 
+// tryWarmRestore attempts to reuse a volume already attached from a previous job on the same instance.
+// Returns a successful result if the volume is still attached and mountable, or an error to fall through to cold restore.
+func (s *AWSSnapshotter) tryWarmRestore(ctx context.Context, mountPoint string) (*RestoreSnapshotOutput, error) {
+	volumeInfo, err := s.loadVolumeInfo(mountPoint)
+	if err != nil {
+		return nil, fmt.Errorf("no volume info: %w", err)
+	}
+
+	s.logger.Info().Msgf("RestoreSnapshot: Found existing volume info for %s (volume %s), checking if still attached...", mountPoint, volumeInfo.VolumeID)
+
+	descOutput, err := s.ec2Client.DescribeVolumes(ctx, &ec2.DescribeVolumesInput{
+		VolumeIds: []string{volumeInfo.VolumeID},
+		Filters: []types.Filter{
+			{Name: aws.String("attachment.instance-id"), Values: []string{s.config.InstanceID}},
+			{Name: aws.String("attachment.status"), Values: []string{"attached"}},
+		},
+	})
+	if err != nil || len(descOutput.Volumes) == 0 {
+		s.logger.Info().Msgf("RestoreSnapshot: Volume %s is no longer attached to this instance", volumeInfo.VolumeID)
+		return nil, fmt.Errorf("volume not attached")
+	}
+
+	s.logger.Info().Msgf("RestoreSnapshot: Warm volume %s detected, reusing (skipping create/attach)...", volumeInfo.VolumeID)
+
+	if strings.HasPrefix(mountPoint, "/var/lib/docker") {
+		if _, err := s.runCommand(ctx, "sudo", "systemctl", "stop", "docker"); err != nil {
+			s.logger.Warn().Msgf("RestoreSnapshot: failed to stop docker: %v", err)
+		}
+	}
+
+	if _, err := s.runCommand(ctx, "mountpoint", "-q", mountPoint); err != nil {
+		if _, err := s.runCommand(ctx, "sudo", "mkdir", "-p", mountPoint); err != nil {
+			return nil, fmt.Errorf("failed to create mount point: %w", err)
+		}
+		if _, err := s.runCommand(ctx, "sudo", "mount", volumeInfo.DeviceName, mountPoint); err != nil {
+			s.logger.Warn().Msgf("RestoreSnapshot: Warm mount failed (%v), detaching stale volume %s and falling through to cold restore", err, volumeInfo.VolumeID)
+			s.ec2Client.DetachVolume(ctx, &ec2.DetachVolumeInput{
+				VolumeId:   aws.String(volumeInfo.VolumeID),
+				InstanceId: aws.String(s.config.InstanceID),
+			})
+			return nil, fmt.Errorf("warm mount failed: %w", err)
+		}
+		s.logger.Info().Msgf("RestoreSnapshot: Warm volume mounted at %s", mountPoint)
+	} else {
+		s.logger.Info().Msgf("RestoreSnapshot: %s already mounted (warm hit)", mountPoint)
+	}
+
+	if !strings.HasPrefix(mountPoint, "/var/lib/docker") {
+		if sudoUser := os.Getenv("SUDO_USER"); sudoUser != "" {
+			s.runCommand(ctx, "sudo", "chown", sudoUser+":"+sudoUser, mountPoint)
+		}
+	}
+
+	if strings.HasPrefix(mountPoint, "/var/lib/docker") {
+		if _, err := s.runCommand(ctx, "sudo", "systemctl", "start", "docker"); err != nil {
+			s.logger.Warn().Msgf("RestoreSnapshot: failed to start docker after warm mount: %v", err)
+		}
+	}
+
+	s.ec2Client.CreateTags(ctx, &ec2.CreateTagsInput{
+		Resources: []string{volumeInfo.VolumeID},
+		Tags: []types.Tag{
+			{Key: aws.String(ttlTagKey), Value: aws.String(fmt.Sprintf("%d", time.Now().Add(time.Duration(defaultVolumeLifeDurationMinutes)*time.Minute).Unix()))},
+		},
+	})
+
+	volumeInfo.NewVolume = false
+	s.saveVolumeInfo(volumeInfo)
+
+	return &RestoreSnapshotOutput{
+		VolumeID:   volumeInfo.VolumeID,
+		DeviceName: volumeInfo.DeviceName,
+		NewVolume:  false,
+	}, nil
+}
+
 // RestoreSnapshot finds the latest snapshot for the current git branch,
 // creates a volume from it (or a new volume if no snapshot exists),
 // attaches it to the instance, and mounts it to the specified mountPoint.
 func (s *AWSSnapshotter) RestoreSnapshot(ctx context.Context, mountPoint string) (*RestoreSnapshotOutput, error) {
+	if output, err := s.tryWarmRestore(ctx, mountPoint); err == nil {
+		return output, nil
+	}
+
 	gitBranch := s.config.GithubRef
-	s.logger.Info().Msgf("RestoreSnapshot: Using git ref: %s", gitBranch)
+	s.logger.Info().Msgf("RestoreSnapshot: Cold restore for %s, using git ref: %s", mountPoint, gitBranch)
 
 	var err error
 
@@ -200,11 +280,9 @@ func (s *AWSSnapshotter) RestoreSnapshot(ctx context.Context, mountPoint string)
 	s.logger.Info().Msgf("RestoreSnapshot: Volume %s attached as %s.", *newVolume.VolumeId, actualDeviceName)
 
 	if strings.HasPrefix(mountPoint, "/var/lib/docker") {
-		// 6. Mounting & Docker
 		s.logger.Info().Msgf("RestoreSnapshot: Stopping docker service...")
 		if _, err := s.runCommand(ctx, "sudo", "systemctl", "stop", "docker"); err != nil {
 			s.logger.Warn().Msgf("RestoreSnapshot: failed to stop docker (may not be running or installed): %v", err)
-
 		}
 	}
 
@@ -213,25 +291,36 @@ func (s *AWSSnapshotter) RestoreSnapshot(ctx context.Context, mountPoint string)
 		s.logger.Warn().Msgf("RestoreSnapshot: Defensive unmount of %s failed (likely not mounted): %v", mountPoint, err)
 	}
 
-	// display disk configuration
-	s.logger.Info().Msgf("RestoreSnapshot: Displaying disk configuration...")
-
-	// actual device name is the last entry from `lsblk -d -n -o PATH,MODEL` that has a MODEL = 'Amazon Elastic Block Store'
-	lsblkOutput, err := s.runCommand(ctx, "lsblk", "-d", "-n", "-o", "PATH,MODEL")
-	if err != nil {
-		s.logger.Warn().Msgf("RestoreSnapshot: Failed to display disk configuration: %v", err)
-	}
-	for _, line := range strings.Split(strings.TrimSpace(string(lsblkOutput)), "\n") {
-		s.logger.Info().Msgf("RestoreSnapshot: lsblk output: %s", line)
-		fields := strings.SplitN(line, " ", 2)
-		s.logger.Info().Msgf("RestoreSnapshot: fields: %v", fields)
-		// first volume is the root volume, so we need to skip it
-		if len(fields) > 1 && strings.TrimSpace(fields[1]) == "Amazon Elastic Block Store" {
-			s.logger.Info().Msgf("RestoreSnapshot: Found volume: %s", fields[0])
-			actualDeviceName = fields[0]
+	// Match the NVMe device to our volume using the serial number.
+	// AWS NVMe serials are the volume ID without the dash: "vol-0abc" → "vol0abc"
+	expectedSerial := strings.Replace(*newVolume.VolumeId, "-", "", 1)
+	s.logger.Info().Msgf("RestoreSnapshot: Looking for NVMe device with serial %s (volume %s)...", expectedSerial, *newVolume.VolumeId)
+	var found bool
+	for attempt := 0; attempt < 10; attempt++ {
+		lsblkOutput, lsblkErr := s.runCommand(ctx, "lsblk", "-d", "-n", "-o", "PATH,SERIAL")
+		if lsblkErr != nil {
+			s.logger.Warn().Msgf("RestoreSnapshot: lsblk failed (attempt %d): %v", attempt+1, lsblkErr)
+			time.Sleep(1 * time.Second)
+			continue
 		}
+		for _, line := range strings.Split(strings.TrimSpace(string(lsblkOutput)), "\n") {
+			fields := strings.Fields(line)
+			if len(fields) >= 2 && fields[1] == expectedSerial {
+				actualDeviceName = fields[0]
+				found = true
+				break
+			}
+		}
+		if found {
+			break
+		}
+		s.logger.Info().Msgf("RestoreSnapshot: Device not yet visible (attempt %d/10), retrying...", attempt+1)
+		time.Sleep(1 * time.Second)
 	}
-	s.logger.Info().Msgf("RestoreSnapshot: Actual device name: %s", actualDeviceName)
+	if !found {
+		return nil, fmt.Errorf("could not find NVMe device for volume %s (expected serial %s)", *newVolume.VolumeId, expectedSerial)
+	}
+	s.logger.Info().Msgf("RestoreSnapshot: Matched volume %s to device %s", *newVolume.VolumeId, actualDeviceName)
 
 	// Save volume info to JSON file
 	volumeInfo := &VolumeInfo{

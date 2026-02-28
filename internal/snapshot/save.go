@@ -13,6 +13,7 @@ import (
 
 const (
 	defaultVolumeLifeDurationMinutes int32 = 20
+	warmVolumeTTLMinutes             int32 = 120 // generous TTL for warm pool reuse
 )
 
 func (s *AWSSnapshotter) CreateSnapshot(ctx context.Context, mountPoint string) (*CreateSnapshotOutput, error) {
@@ -41,7 +42,7 @@ func (s *AWSSnapshotter) CreateSnapshot(ctx context.Context, mountPoint string) 
 	s.logger.Info().Msgf("CreateSnapshot: Unmounting %s (from device %s, volume %s)...", mountPoint, volumeInfo.DeviceName, volumeInfo.VolumeID)
 	if _, err := s.runCommand(ctx, "sudo", "umount", mountPoint); err != nil {
 		dfOutput, checkErr := s.runCommand(ctx, "df", mountPoint)
-		if checkErr == nil && strings.Contains(string(dfOutput), mountPoint) { // If still mounted, then error
+		if checkErr == nil && strings.Contains(string(dfOutput), mountPoint) {
 			return nil, fmt.Errorf("failed to unmount %s: %w. Output: %s", mountPoint, err, string(dfOutput))
 		}
 		s.logger.Warn().Msgf("CreateSnapshot: Unmount of %s failed but it seems not mounted anymore: %v", mountPoint, err)
@@ -49,39 +50,23 @@ func (s *AWSSnapshotter) CreateSnapshot(ctx context.Context, mountPoint string) 
 		s.logger.Info().Msgf("CreateSnapshot: Successfully unmounted %s.", mountPoint)
 	}
 
-	// Update TTL tag on volume to extend until 10min from now
+	// Extend TTL generously for warm pool reuse — volume stays attached for the next job
 	_, err = s.ec2Client.CreateTags(ctx, &ec2.CreateTagsInput{
 		Resources: []string{volumeInfo.VolumeID},
 		Tags: []types.Tag{
-			{Key: aws.String(ttlTagKey), Value: aws.String(fmt.Sprintf("%d", time.Now().Add(10*time.Minute).Unix()))},
+			{Key: aws.String(ttlTagKey), Value: aws.String(fmt.Sprintf("%d", time.Now().Add(time.Duration(warmVolumeTTLMinutes)*time.Minute).Unix()))},
 		},
 	})
 	if err != nil {
 		s.logger.Warn().Msgf("Failed to update TTL tag on volume %s: %v", volumeInfo.VolumeID, err)
 	}
 
-	s.logger.Info().Msgf("CreateSnapshot: Detaching volume %s...", volumeInfo.VolumeID)
-	_, err = s.ec2Client.DetachVolume(ctx, &ec2.DetachVolumeInput{
-		VolumeId:   aws.String(volumeInfo.VolumeID),
-		InstanceId: aws.String(s.config.InstanceID),
-	})
-	if err != nil {
-		return nil, fmt.Errorf("failed to initiate detach for volume %s: %w", volumeInfo.VolumeID, err)
-	}
-
-	volumeDetachedWaiter := ec2.NewVolumeAvailableWaiter(s.ec2Client, defaultVolumeAvailableWaiterOptions) // Available state implies detached
-	s.logger.Info().Msgf("CreateSnapshot: Waiting for volume %s to become available (detached)...", volumeInfo.VolumeID)
-	if err := volumeDetachedWaiter.Wait(ctx, &ec2.DescribeVolumesInput{VolumeIds: []string{volumeInfo.VolumeID}}, defaultVolumeAvailableMaxWaitTime); err != nil {
-		return nil, fmt.Errorf("volume %s did not become available (detach) in time: %w", volumeInfo.VolumeID, err)
-	}
-	s.logger.Info().Msgf("CreateSnapshot: Volume %s is detached.", volumeInfo.VolumeID)
-
-	// 3. Create new snapshot
+	// Snapshot while volume is still attached — AWS supports this as long as the FS is unmounted
 	currentTime := time.Now()
-	s.logger.Info().Msgf("CreateSnapshot: Creating snapshot '%s' from volume %s for branch %s...", s.config.SnapshotName, volumeInfo.VolumeID, s.config.GithubRef)
-	snapshotTags := append(s.defaultTags(), []types.Tag{
-		{Key: aws.String(nameTagKey), Value: aws.String(s.config.SnapshotName)},
-	}...)
+	s.logger.Info().Msgf("CreateSnapshot: Creating snapshot '%s' from volume %s (still attached)...", s.config.SnapshotName, volumeInfo.VolumeID)
+	snapshotTags := append(s.defaultTags(), types.Tag{
+		Key: aws.String(nameTagKey), Value: aws.String(s.config.SnapshotName),
+	})
 	createSnapshotOutput, err := s.ec2Client.CreateSnapshot(ctx, &ec2.CreateSnapshotInput{
 		VolumeId: aws.String(volumeInfo.VolumeID),
 		TagSpecifications: []types.TagSpecification{
@@ -99,11 +84,11 @@ func (s *AWSSnapshotter) CreateSnapshot(ctx context.Context, mountPoint string) 
 	s.logger.Info().Msgf("CreateSnapshot: Snapshot %s creation initiated.", newSnapshotID)
 
 	if volumeInfo.NewVolume {
-		s.logger.Info().Msgf("CreateSnapshot: creating from a new volume, so waiting for initial snapshot completion. This may take a few minutes.")
+		s.logger.Info().Msgf("CreateSnapshot: Initial snapshot from new volume, waiting for completion...")
 	} else if s.config.WaitForCompletion {
-		s.logger.Info().Msgf("CreateSnapshot: waiting for snapshot completion before returning.")
+		s.logger.Info().Msgf("CreateSnapshot: Waiting for snapshot completion (wait_for_completion=true)...")
 	} else {
-		s.logger.Info().Msgf("CreateSnapshot: not waiting for snapshot completion, returning immediately.")
+		s.logger.Info().Msgf("CreateSnapshot: Snapshot initiated, volume %s left attached for warm reuse.", volumeInfo.VolumeID)
 		return &CreateSnapshotOutput{SnapshotID: newSnapshotID}, nil
 	}
 
@@ -112,16 +97,7 @@ func (s *AWSSnapshotter) CreateSnapshot(ctx context.Context, mountPoint string) 
 	if err := snapshotCompletedWaiter.Wait(ctx, &ec2.DescribeSnapshotsInput{SnapshotIds: []string{newSnapshotID}}, defaultSnapshotCompletedMaxWaitTime); err != nil {
 		return nil, fmt.Errorf("snapshot %s did not complete in time: %w", newSnapshotID, err)
 	}
-	s.logger.Info().Msgf("CreateSnapshot: Snapshot %s completed.", newSnapshotID)
-
-	// 5. Delete the jobVolumeID (the volume that was just snapshotted)
-	s.logger.Info().Msgf("CreateSnapshot: Deleting original volume %s as its state is now in snapshot %s...", volumeInfo.VolumeID, newSnapshotID)
-	_, err = s.ec2Client.DeleteVolume(ctx, &ec2.DeleteVolumeInput{VolumeId: aws.String(volumeInfo.VolumeID)})
-	if err != nil {
-		s.logger.Warn().Msgf("Warning: Failed to delete volume %s: %v. Manual cleanup may be required.", volumeInfo.VolumeID, err)
-	} else {
-		s.logger.Info().Msgf("CreateSnapshot: Volume %s successfully deleted.", volumeInfo.VolumeID)
-	}
+	s.logger.Info().Msgf("CreateSnapshot: Snapshot %s completed. Volume %s left attached for warm reuse.", newSnapshotID, volumeInfo.VolumeID)
 
 	return &CreateSnapshotOutput{SnapshotID: newSnapshotID}, nil
 }
