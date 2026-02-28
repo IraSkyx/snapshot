@@ -153,6 +153,16 @@ func (s *AWSSnapshotter) RestoreSnapshot(ctx context.Context) (*RestoreSnapshotO
 	for _, tag := range s.defaultTags() {
 		filters = append(filters, types.Filter{Name: aws.String(fmt.Sprintf("tag:%s", *tag.Key)), Values: []string{*tag.Value}})
 	}
+	// Also match legacy snapshots created with path=_all_ before suffix-aware path tags
+	if s.config.Suffix != "" {
+		pathFilterName := fmt.Sprintf("tag:%s", snapshotTagKeyPath)
+		for i, f := range filters {
+			if *f.Name == pathFilterName {
+				filters[i].Values = append(filters[i].Values, "_all_")
+				break
+			}
+		}
+	}
 	s.logger.Info().Msgf("RestoreSnapshot: Searching for the latest snapshot for branch: %s and filters: %s", gitBranch, utils.PrettyPrint(filters))
 	snapshotsOutput, err := s.ec2Client.DescribeSnapshots(ctx, &ec2.DescribeSnapshotsInput{
 		Filters:  filters,

@@ -168,6 +168,13 @@ func (s *AWSSnapshotter) volumeInfoPath() string {
 	return filepath.Join("/runs-on", fmt.Sprintf("snapshot-%s.json", s.config.Suffix))
 }
 
+func (s *AWSSnapshotter) pathTagValue() string {
+	if s.config.Suffix != "" {
+		return "_all_-" + s.config.Suffix
+	}
+	return "_all_"
+}
+
 func (s *AWSSnapshotter) defaultTags() []types.Tag {
 	tags := []types.Tag{
 		{Key: aws.String(snapshotTagKeyVersion), Value: aws.String(s.config.Version)},
@@ -175,7 +182,7 @@ func (s *AWSSnapshotter) defaultTags() []types.Tag {
 		{Key: aws.String(snapshotTagKeyBranch), Value: aws.String(s.getSnapshotTagValue())},
 		{Key: aws.String(snapshotTagKeyArch), Value: aws.String(s.arch())},
 		{Key: aws.String(snapshotTagKeyPlatform), Value: aws.String(s.platform())},
-		{Key: aws.String(snapshotTagKeyPath), Value: aws.String("_all_")},
+		{Key: aws.String(snapshotTagKeyPath), Value: aws.String(s.pathTagValue())},
 		{Key: aws.String(snapshotTagKeySuffix), Value: aws.String(s.config.Suffix)},
 	}
 	for _, tag := range s.config.CustomTags {
