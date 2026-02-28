@@ -319,21 +319,30 @@ func (s *AWSSnapshotter) RestoreSnapshot(ctx context.Context) (*RestoreSnapshotO
 	}, nil
 }
 
-// buildFilters creates the default AWS snapshot search filters.
-// If a suffix is set, the path filter includes both the suffix-aware and legacy _all_ values.
+// buildFilters creates the AWS snapshot search filters for exact-suffix matching.
+// Excludes branch-base (only used for cross-suffix fallback).
+// Adds legacy branch/path values so pre-migration snapshots are still found.
 func (s *AWSSnapshotter) buildFilters() []types.Filter {
 	filters := []types.Filter{
 		{Name: aws.String("status"), Values: []string{string(types.SnapshotStateCompleted)}},
 	}
 	for _, tag := range s.defaultTags() {
-		filters = append(filters, types.Filter{Name: aws.String(fmt.Sprintf("tag:%s", *tag.Key)), Values: []string{*tag.Value}})
+		key := *tag.Key
+		if key == snapshotTagKeyBranchBase {
+			continue
+		}
+		filters = append(filters, types.Filter{Name: aws.String(fmt.Sprintf("tag:%s", key)), Values: []string{*tag.Value}})
 	}
 	if s.config.Suffix != "" {
-		pathFilterName := fmt.Sprintf("tag:%s", snapshotTagKeyPath)
+		// Match legacy snapshots with branch=X (no ::suffix) and path=_all_
+		branchFilter := fmt.Sprintf("tag:%s", snapshotTagKeyBranch)
+		pathFilter := fmt.Sprintf("tag:%s", snapshotTagKeyPath)
 		for i, f := range filters {
-			if *f.Name == pathFilterName {
+			if *f.Name == branchFilter {
+				filters[i].Values = append(filters[i].Values, s.config.GithubRef)
+			}
+			if *f.Name == pathFilter {
 				filters[i].Values = append(filters[i].Values, "_all_")
-				break
 			}
 		}
 	}
@@ -378,13 +387,18 @@ func (s *AWSSnapshotter) findSnapshot(ctx context.Context, branch string) *types
 	}
 
 	if s.config.RunnerConfig.DefaultBranch != "" {
-		s.logger.Info().Msgf("RestoreSnapshot: No snapshot found for branch %s, trying default branch %s", branch, s.config.RunnerConfig.DefaultBranch)
-		if err := replaceFilterValues(filters, "tag:"+snapshotTagKeyBranch, []string{s.getSnapshotTagValueDefaultBranch()}); err != nil {
+		defaultBranch := s.config.RunnerConfig.DefaultBranch
+		s.logger.Info().Msgf("RestoreSnapshot: No snapshot found for branch %s, trying default branch %s", branch, defaultBranch)
+		branchValues := []string{s.defaultBranchTagValue()}
+		if s.config.Suffix != "" {
+			branchValues = append(branchValues, defaultBranch)
+		}
+		if err := replaceFilterValues(filters, "tag:"+snapshotTagKeyBranch, branchValues); err != nil {
 			s.logger.Warn().Msgf("Failed to update branch filter: %v", err)
 			return nil
 		}
 		if snap := s.searchSnapshots(ctx, filters); snap != nil {
-			s.logger.Info().Msgf("RestoreSnapshot: Found snapshot %s from default branch %s", *snap.SnapshotId, s.config.RunnerConfig.DefaultBranch)
+			s.logger.Info().Msgf("RestoreSnapshot: Found snapshot %s from default branch %s", *snap.SnapshotId, defaultBranch)
 			return snap
 		}
 	}
@@ -392,39 +406,76 @@ func (s *AWSSnapshotter) findSnapshot(ctx context.Context, branch string) *types
 	return nil
 }
 
-// findSnapshotAnySuffix searches for any snapshot from the same repo, ignoring suffix/path tags.
-// Used as a last-resort fallback when no suffix-specific snapshot exists.
+// findSnapshotAnySuffix searches for any snapshot from the same repo/branch, ignoring suffix/path.
+// Skips branch, branch-base, path, and suffix filters to match any job's snapshot.
+// Then filters by branch in-code since we can't do a prefix/OR match across old and new tagging.
 func (s *AWSSnapshotter) findSnapshotAnySuffix(ctx context.Context, branch string) *types.Snapshot {
 	filters := []types.Filter{
 		{Name: aws.String("status"), Values: []string{string(types.SnapshotStateCompleted)}},
 	}
+	skipTags := map[string]bool{
+		snapshotTagKeyPath:       true,
+		snapshotTagKeySuffix:     true,
+		snapshotTagKeyBranch:     true,
+		snapshotTagKeyBranchBase: true,
+	}
 	for _, tag := range s.defaultTags() {
-		key := *tag.Key
-		if key == snapshotTagKeyPath || key == snapshotTagKeySuffix {
+		if skipTags[*tag.Key] {
 			continue
 		}
-		filters = append(filters, types.Filter{Name: aws.String(fmt.Sprintf("tag:%s", key)), Values: []string{*tag.Value}})
+		filters = append(filters, types.Filter{Name: aws.String(fmt.Sprintf("tag:%s", *tag.Key)), Values: []string{*tag.Value}})
+	}
+
+	searchBranch := func(targetBranch string) *types.Snapshot {
+		// Query all snapshots for this repo (any branch/suffix), then filter in-code
+		output, err := s.ec2Client.DescribeSnapshots(ctx, &ec2.DescribeSnapshotsInput{
+			Filters:  filters,
+			OwnerIds: []string{"self"},
+		})
+		if err != nil {
+			s.logger.Warn().Msgf("DescribeSnapshots failed: %v", err)
+			return nil
+		}
+
+		var matching []types.Snapshot
+		for _, snap := range output.Snapshots {
+			branchTag := getTagValue(snap.Tags, snapshotTagKeyBranch)
+			branchBaseTag := getTagValue(snap.Tags, snapshotTagKeyBranchBase)
+			if branchTag == targetBranch || branchBaseTag == targetBranch || strings.HasPrefix(branchTag, targetBranch+"::") {
+				matching = append(matching, snap)
+			}
+		}
+		return findLatestSnapshot(matching)
 	}
 
 	s.logger.Info().Msgf("RestoreSnapshot: Cross-suffix fallback search (branch=%s)", branch)
-	if snap := s.searchSnapshots(ctx, filters); snap != nil {
+	if snap := searchBranch(branch); snap != nil {
 		s.logger.Info().Msgf("RestoreSnapshot: Found cross-suffix snapshot %s for branch %s", *snap.SnapshotId, branch)
 		return snap
 	}
 
 	if s.config.RunnerConfig.DefaultBranch != "" {
-		s.logger.Info().Msgf("RestoreSnapshot: Cross-suffix fallback, trying default branch %s", s.config.RunnerConfig.DefaultBranch)
-		if err := replaceFilterValues(filters, "tag:"+snapshotTagKeyBranch, []string{s.getSnapshotTagValueDefaultBranch()}); err != nil {
-			s.logger.Warn().Msgf("Failed to update branch filter: %v", err)
-			return nil
-		}
-		if snap := s.searchSnapshots(ctx, filters); snap != nil {
-			s.logger.Info().Msgf("RestoreSnapshot: Found cross-suffix snapshot %s from default branch %s", *snap.SnapshotId, s.config.RunnerConfig.DefaultBranch)
+		defaultBranch := s.config.RunnerConfig.DefaultBranch
+		s.logger.Info().Msgf("RestoreSnapshot: Cross-suffix fallback, trying default branch %s", defaultBranch)
+		if snap := searchBranch(defaultBranch); snap != nil {
+			s.logger.Info().Msgf("RestoreSnapshot: Found cross-suffix snapshot %s from default branch %s", *snap.SnapshotId, defaultBranch)
 			return snap
 		}
 	}
 
 	return nil
+}
+
+func getTagValue(tags []types.Tag, key string) string {
+	for _, tag := range tags {
+		if tag.Key != nil && *tag.Key == key {
+			if tag.Value != nil {
+				return *tag.Value
+			}
+			return ""
+		}
+	}
+	return ""
 }
 
 func replaceFilterValues(filters []types.Filter, name string, values []string) error {

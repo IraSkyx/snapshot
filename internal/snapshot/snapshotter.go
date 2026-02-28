@@ -20,13 +20,14 @@ import (
 )
 
 const (
-	snapshotTagKeyArch       = "runs-on-snapshot-arch"
-	snapshotTagKeyPlatform   = "runs-on-snapshot-platform"
-	snapshotTagKeyBranch     = "runs-on-snapshot-branch"
-	snapshotTagKeyRepository = "runs-on-snapshot-repository"
-	snapshotTagKeyVersion    = "runs-on-snapshot-version"
-	snapshotTagKeyPath       = "runs-on-snapshot-path"
-	snapshotTagKeySuffix     = "runs-on-snapshot-suffix"
+	snapshotTagKeyArch           = "runs-on-snapshot-arch"
+	snapshotTagKeyPlatform       = "runs-on-snapshot-platform"
+	snapshotTagKeyBranch         = "runs-on-snapshot-branch"
+	snapshotTagKeyBranchBase     = "runs-on-snapshot-branch-base"
+	snapshotTagKeyRepository     = "runs-on-snapshot-repository"
+	snapshotTagKeyVersion        = "runs-on-snapshot-version"
+	snapshotTagKeyPath           = "runs-on-snapshot-path"
+	snapshotTagKeySuffix         = "runs-on-snapshot-suffix"
 	nameTagKey               = "Name"
 	timestampTagKey          = "runs-on-timestamp"
 	ttlTagKey                = "runs-on-delete-after"
@@ -179,7 +180,8 @@ func (s *AWSSnapshotter) defaultTags() []types.Tag {
 	tags := []types.Tag{
 		{Key: aws.String(snapshotTagKeyVersion), Value: aws.String(s.config.Version)},
 		{Key: aws.String(snapshotTagKeyRepository), Value: aws.String(s.config.GithubRepository)},
-		{Key: aws.String(snapshotTagKeyBranch), Value: aws.String(s.getSnapshotTagValue())},
+		{Key: aws.String(snapshotTagKeyBranch), Value: aws.String(s.branchTagValue())},
+		{Key: aws.String(snapshotTagKeyBranchBase), Value: aws.String(s.config.GithubRef)},
 		{Key: aws.String(snapshotTagKeyArch), Value: aws.String(s.arch())},
 		{Key: aws.String(snapshotTagKeyPlatform), Value: aws.String(s.platform())},
 		{Key: aws.String(snapshotTagKeyPath), Value: aws.String(s.pathTagValue())},
@@ -225,11 +227,19 @@ func (s *AWSSnapshotter) loadVolumeInfo() (*VolumeInfo, error) {
 	return &volumeInfo, nil
 }
 
-func (s *AWSSnapshotter) getSnapshotTagValue() string {
+// branchTagValue encodes the suffix into the branch tag so RunsOn's cleanup
+// treats each (branch, suffix) pair as a separate snapshot group.
+func (s *AWSSnapshotter) branchTagValue() string {
+	if s.config.Suffix != "" {
+		return s.config.GithubRef + "::" + s.config.Suffix
+	}
 	return s.config.GithubRef
 }
 
-func (s *AWSSnapshotter) getSnapshotTagValueDefaultBranch() string {
+func (s *AWSSnapshotter) defaultBranchTagValue() string {
+	if s.config.Suffix != "" {
+		return s.config.RunnerConfig.DefaultBranch + "::" + s.config.Suffix
+	}
 	return s.config.RunnerConfig.DefaultBranch
 }
 
