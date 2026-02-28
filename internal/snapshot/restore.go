@@ -4,8 +4,11 @@ import (
 	"context"
 	"fmt"
 	"os"
+	"os/user"
 	"path/filepath"
+	"strconv"
 	"strings"
+	"syscall"
 	"time"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
@@ -45,7 +48,21 @@ func (s *AWSSnapshotter) setupBindMounts(ctx context.Context) error {
 
 		if !isDocker {
 			if sudoUser := os.Getenv("SUDO_USER"); sudoUser != "" {
-				s.runCommand(ctx, "sudo", "chown", sudoUser+":"+sudoUser, subDir)
+				needsChown := true
+				if u, err := user.Lookup(sudoUser); err == nil {
+					if uid, err := strconv.Atoi(u.Uid); err == nil {
+						if info, err := os.Stat(subDir); err == nil {
+							if stat, ok := info.Sys().(*syscall.Stat_t); ok && int(stat.Uid) == uid {
+								needsChown = false
+							}
+						}
+					}
+				}
+				if needsChown {
+					s.runCommand(ctx, "sudo", "chown", sudoUser+":"+sudoUser, subDir)
+				} else {
+					s.logger.Info().Msgf("Ownership of %s already correct, skipping chown", subDir)
+				}
 			}
 		}
 
