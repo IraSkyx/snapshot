@@ -4,6 +4,7 @@ import (
 	"context"
 	"flag"
 	"os"
+	"sync"
 
 	"github.com/rs/zerolog"
 	"github.com/runs-on/snapshot/internal/config"
@@ -45,21 +46,27 @@ func handlePostExecution(action *githubactions.Action, ctx context.Context, logg
 		return
 	}
 
+	var wg sync.WaitGroup
 	for i, path := range cfg.Paths {
-		pathCfg := cfg.ForPath(i)
-		action.Infof("Snapshotting volume for %s (%d/%d)...", path, i+1, len(cfg.Paths))
-		snapshotter, err := snapshot.NewAWSSnapshotter(ctx, logger, pathCfg)
-		if err != nil {
-			action.Errorf("Failed to create snapshotter for %s: %v", path, err)
-			continue
-		}
-		snap, err := snapshotter.CreateSnapshot(ctx, path)
-		if err != nil {
-			action.Errorf("Failed to snapshot volume for %s: %v", path, err)
-			continue
-		}
-		action.Infof("Snapshot created for %s: %s. Note that it might take a few minutes to be available for use.", path, snap.SnapshotID)
+		wg.Add(1)
+		go func(i int, path string) {
+			defer wg.Done()
+			pathCfg := cfg.ForPath(i)
+			action.Infof("Snapshotting volume for %s (%d/%d)...", path, i+1, len(cfg.Paths))
+			snapshotter, err := snapshot.NewAWSSnapshotter(ctx, logger, pathCfg)
+			if err != nil {
+				action.Errorf("Failed to create snapshotter for %s: %v", path, err)
+				return
+			}
+			snap, err := snapshotter.CreateSnapshot(ctx, path)
+			if err != nil {
+				action.Errorf("Failed to snapshot volume for %s: %v", path, err)
+				return
+			}
+			action.Infof("Snapshot created for %s: %s. Note that it might take a few minutes to be available for use.", path, snap.SnapshotID)
+		}(i, path)
 	}
+	wg.Wait()
 	action.Infof("Post-execution phase finished.")
 }
 
