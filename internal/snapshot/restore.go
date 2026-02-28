@@ -290,10 +290,12 @@ func (s *AWSSnapshotter) RestoreSnapshot(ctx context.Context) (*RestoreSnapshotO
 	s.logger.Info().Msgf("RestoreSnapshot: Looking for NVMe device with serial %s...", expectedSerial)
 	var actualDeviceName string
 	var found bool
+	backoff := 200 * time.Millisecond
 	for attempt := 0; attempt < 10; attempt++ {
 		lsblkOutput, lsblkErr := s.runCommand(ctx, "lsblk", "-d", "-n", "-o", "PATH,SERIAL")
 		if lsblkErr != nil {
-			time.Sleep(1 * time.Second)
+			time.Sleep(backoff)
+			backoff = min(backoff*2, 2*time.Second)
 			continue
 		}
 		for _, line := range strings.Split(strings.TrimSpace(string(lsblkOutput)), "\n") {
@@ -307,8 +309,9 @@ func (s *AWSSnapshotter) RestoreSnapshot(ctx context.Context) (*RestoreSnapshotO
 		if found {
 			break
 		}
-		s.logger.Info().Msgf("Device not yet visible (attempt %d/10), retrying...", attempt+1)
-		time.Sleep(1 * time.Second)
+		s.logger.Info().Msgf("Device not yet visible (attempt %d/10), retrying in %s...", attempt+1, backoff)
+		time.Sleep(backoff)
+		backoff = min(backoff*2, 2*time.Second)
 	}
 	if !found {
 		err = fmt.Errorf("could not find NVMe device for volume %s (serial %s)", *newVolume.VolumeId, expectedSerial)
