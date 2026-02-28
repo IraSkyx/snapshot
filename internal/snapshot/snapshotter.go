@@ -39,18 +39,18 @@ const (
 )
 
 var defaultSnapshotCompletedWaiterOptions = func(o *ec2.SnapshotCompletedWaiterOptions) {
-	o.MaxDelay = 3 * time.Second
-	o.MinDelay = 3 * time.Second
+	o.MinDelay = 2 * time.Second
+	o.MaxDelay = 5 * time.Second
 }
 
 var defaultVolumeInUseWaiterOptions = func(o *ec2.VolumeInUseWaiterOptions) {
+	o.MinDelay = 1 * time.Second
 	o.MaxDelay = 3 * time.Second
-	o.MinDelay = 3 * time.Second
 }
 
 var defaultVolumeAvailableWaiterOptions = func(o *ec2.VolumeAvailableWaiterOptions) {
+	o.MinDelay = 1 * time.Second
 	o.MaxDelay = 3 * time.Second
-	o.MinDelay = 3 * time.Second
 }
 
 func sanitizePath(path string) string {
