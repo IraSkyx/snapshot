@@ -13,44 +13,47 @@ import (
 
 const (
 	defaultVolumeLifeDurationMinutes int32 = 20
-	warmVolumeTTLMinutes             int32 = 120 // generous TTL for warm pool reuse
+	warmVolumeTTLMinutes             int32 = 120
 )
 
-func (s *AWSSnapshotter) CreateSnapshot(ctx context.Context, mountPoint string) (*CreateSnapshotOutput, error) {
-	gitBranch := s.config.GithubRef
-	s.logger.Info().Msgf("CreateSnapshot: Using git ref: %s, Instance ID: %s, MountPoint: %s", gitBranch, s.config.InstanceID, mountPoint)
+func (s *AWSSnapshotter) CreateSnapshot(ctx context.Context) (*CreateSnapshotOutput, error) {
+	s.logger.Info().Msgf("CreateSnapshot: Using git ref: %s, Instance ID: %s", s.config.GithubRef, s.config.InstanceID)
 
-	// Load volume info from JSON file
-	volumeInfo, err := s.loadVolumeInfo(mountPoint)
+	volumeInfo, err := s.loadVolumeInfo()
 	if err != nil {
 		return nil, fmt.Errorf("failed to load volume info: %w", err)
 	}
 
-	// 2. Operations on jobVolumeID
-	if strings.HasPrefix(mountPoint, "/var/lib/docker") {
-		s.logger.Info().Msgf("CreateSnapshot: Cleaning up useless files...")
-		if _, err := s.runCommand(ctx, "sudo", "docker", "builder", "prune", "-f"); err != nil {
-			s.logger.Warn().Msgf("Warning: failed to prune docker builder: %v", err)
+	// Unmount all bind mounts first
+	for _, path := range s.config.Paths {
+		isDocker := strings.HasPrefix(path, "/var/lib/docker")
+
+		if isDocker {
+			if _, err := s.runCommand(ctx, "sudo", "docker", "builder", "prune", "-f"); err != nil {
+				s.logger.Warn().Msgf("failed to prune docker builder: %v", err)
+			}
+			if _, err := s.runCommand(ctx, "sudo", "systemctl", "stop", "docker"); err != nil {
+				s.logger.Warn().Msgf("failed to stop docker: %v", err)
+			}
 		}
 
-		s.logger.Info().Msgf("CreateSnapshot: Stopping docker service...")
-		if _, err := s.runCommand(ctx, "sudo", "systemctl", "stop", "docker"); err != nil {
-			s.logger.Warn().Msgf("Warning: failed to stop docker (may not be running or installed): %v", err)
+		s.logger.Info().Msgf("CreateSnapshot: Unmounting bind mount %s...", path)
+		if _, err := s.runCommand(ctx, "sudo", "umount", path); err != nil {
+			s.logger.Warn().Msgf("Unmount of %s failed (may already be unmounted): %v", path, err)
 		}
 	}
 
-	s.logger.Info().Msgf("CreateSnapshot: Unmounting %s (from device %s, volume %s)...", mountPoint, volumeInfo.DeviceName, volumeInfo.VolumeID)
-	if _, err := s.runCommand(ctx, "sudo", "umount", mountPoint); err != nil {
-		dfOutput, checkErr := s.runCommand(ctx, "df", mountPoint)
-		if checkErr == nil && strings.Contains(string(dfOutput), mountPoint) {
-			return nil, fmt.Errorf("failed to unmount %s: %w. Output: %s", mountPoint, err, string(dfOutput))
+	// Unmount base volume for filesystem consistency
+	s.logger.Info().Msgf("CreateSnapshot: Unmounting base volume at %s...", baseMountPoint)
+	if _, err := s.runCommand(ctx, "sudo", "umount", baseMountPoint); err != nil {
+		dfOutput, checkErr := s.runCommand(ctx, "df", baseMountPoint)
+		if checkErr == nil && strings.Contains(string(dfOutput), baseMountPoint) {
+			return nil, fmt.Errorf("failed to unmount base volume %s: %w. Output: %s", baseMountPoint, err, string(dfOutput))
 		}
-		s.logger.Warn().Msgf("CreateSnapshot: Unmount of %s failed but it seems not mounted anymore: %v", mountPoint, err)
-	} else {
-		s.logger.Info().Msgf("CreateSnapshot: Successfully unmounted %s.", mountPoint)
+		s.logger.Warn().Msgf("Unmount of %s failed but seems not mounted: %v", baseMountPoint, err)
 	}
 
-	// Extend TTL generously for warm pool reuse — volume stays attached for the next job
+	// Extend TTL for warm pool reuse
 	_, err = s.ec2Client.CreateTags(ctx, &ec2.CreateTagsInput{
 		Resources: []string{volumeInfo.VolumeID},
 		Tags: []types.Tag{
@@ -61,7 +64,7 @@ func (s *AWSSnapshotter) CreateSnapshot(ctx context.Context, mountPoint string) 
 		s.logger.Warn().Msgf("Failed to update TTL tag on volume %s: %v", volumeInfo.VolumeID, err)
 	}
 
-	// Snapshot while volume is still attached — AWS supports this as long as the FS is unmounted
+	// Snapshot while volume is still attached
 	currentTime := time.Now()
 	s.logger.Info().Msgf("CreateSnapshot: Creating snapshot '%s' from volume %s (still attached)...", s.config.SnapshotName, volumeInfo.VolumeID)
 	snapshotTags := append(s.defaultTags(), types.Tag{
@@ -69,12 +72,10 @@ func (s *AWSSnapshotter) CreateSnapshot(ctx context.Context, mountPoint string) 
 	})
 	createSnapshotOutput, err := s.ec2Client.CreateSnapshot(ctx, &ec2.CreateSnapshotInput{
 		VolumeId: aws.String(volumeInfo.VolumeID),
-		TagSpecifications: []types.TagSpecification{
-			{
-				ResourceType: types.ResourceTypeSnapshot,
-				Tags:         snapshotTags,
-			},
-		},
+		TagSpecifications: []types.TagSpecification{{
+			ResourceType: types.ResourceTypeSnapshot,
+			Tags:         snapshotTags,
+		}},
 		Description: aws.String(fmt.Sprintf("Snapshot for branch %s taken at %s", s.config.GithubRef, currentTime.Format(time.RFC3339))),
 	})
 	if err != nil {
@@ -92,7 +93,6 @@ func (s *AWSSnapshotter) CreateSnapshot(ctx context.Context, mountPoint string) 
 		return &CreateSnapshotOutput{SnapshotID: newSnapshotID}, nil
 	}
 
-	s.logger.Info().Msgf("CreateSnapshot: Waiting for snapshot %s completion...", newSnapshotID)
 	snapshotCompletedWaiter := ec2.NewSnapshotCompletedWaiter(s.ec2Client, defaultSnapshotCompletedWaiterOptions)
 	if err := snapshotCompletedWaiter.Wait(ctx, &ec2.DescribeSnapshotsInput{SnapshotIds: []string{newSnapshotID}}, defaultSnapshotCompletedMaxWaitTime); err != nil {
 		return nil, fmt.Errorf("snapshot %s did not complete in time: %w", newSnapshotID, err)

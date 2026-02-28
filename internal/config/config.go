@@ -16,8 +16,6 @@ const requiredTagKey = "runs-on-stack-name"
 
 type Config struct {
 	Paths                    []string
-	Path                     string
-	DeviceIndex              int
 	Version                  string
 	WaitForCompletion        bool
 	Save                     bool
@@ -122,17 +120,6 @@ func NewConfigFromInputs(action *githubactions.Action) *Config {
 	action.Infof("Input 'wait_for_completion': %t", cfg.WaitForCompletion)
 
 	return cfg
-}
-
-// ForPath returns a copy of the config scoped to a single path at the given index.
-// SnapshotName and VolumeName are cleared so the snapshotter generates path-specific names.
-func (c *Config) ForPath(index int) *Config {
-	cp := *c
-	cp.Path = c.Paths[index]
-	cp.DeviceIndex = index
-	cp.SnapshotName = ""
-	cp.VolumeName = ""
-	return &cp
 }
 
 func parseInt(action *githubactions.Action, input string, min int, max int) int32 {

@@ -20,7 +20,6 @@ import (
 )
 
 const (
-	// Tags used for resource identification
 	snapshotTagKeyArch       = "runs-on-snapshot-arch"
 	snapshotTagKeyPlatform   = "runs-on-snapshot-platform"
 	snapshotTagKeyBranch     = "runs-on-snapshot-branch"
@@ -30,6 +29,9 @@ const (
 	nameTagKey               = "Name"
 	timestampTagKey          = "runs-on-timestamp"
 	ttlTagKey                = "runs-on-delete-after"
+
+	baseMountPoint    = "/mnt/runs-on-snapshot"
+	suggestedDeviceName = "/dev/sdf"
 
 	defaultVolumeInUseMaxWaitTime       = 5 * time.Minute
 	defaultVolumeAvailableMaxWaitTime   = 5 * time.Minute
@@ -51,48 +53,38 @@ var defaultVolumeAvailableWaiterOptions = func(o *ec2.VolumeAvailableWaiterOptio
 	o.MinDelay = 3 * time.Second
 }
 
-func suggestedDeviceNameForIndex(index int) string {
-	return fmt.Sprintf("/dev/sd%c", 'f'+rune(index))
-}
-
 func sanitizePath(path string) string {
 	return strings.Trim(strings.ReplaceAll(path, "/", "-"), "-")
 }
 
-// Snapshotter interface from the original file - kept for reference
 type Snapshotter interface {
 	CreateSnapshot(ctx context.Context, snapshot *Snapshot) error
 	GetSnapshot(ctx context.Context, id string) (*Snapshot, error)
 	DeleteSnapshot(ctx context.Context, id string) error
 }
 
-// AWSSnapshotter provides methods to manage EBS snapshots and volumes.
 type AWSSnapshotter struct {
 	logger    *zerolog.Logger
 	config    *runsOnConfig.Config
 	ec2Client *ec2.Client
 }
 
-// Snapshot struct from the original file - kept for reference, but not directly used by new funcs
 type Snapshot struct {
 	ID        string    `json:"id"`
 	CreatedAt time.Time `json:"created_at"`
 	UpdatedAt time.Time `json:"updated_at"`
 }
 
-// RestoreSnapshotOutput holds the results of RestoreSnapshot.
 type RestoreSnapshotOutput struct {
 	VolumeID   string
 	DeviceName string
 	NewVolume  bool
 }
 
-// CreateSnapshotOutput holds the results of CreateSnapshot.
 type CreateSnapshotOutput struct {
 	SnapshotID string
 }
 
-// VolumeInfo stores information about the mounted volume
 type VolumeInfo struct {
 	VolumeID     string `json:"volume_id"`
 	DeviceName   string `json:"device_name"`
@@ -101,8 +93,6 @@ type VolumeInfo struct {
 	NewVolume    bool   `json:"new_volume,omitempty"`
 }
 
-// NewAWSSnapshotter creates a new AWSSnapshotter instance.
-// It initializes the AWS SDK configuration and fetches EC2 instance metadata.
 func NewAWSSnapshotter(ctx context.Context, logger *zerolog.Logger, cfg *runsOnConfig.Config) (*AWSSnapshotter, error) {
 	awsConfig, err := utils.GetAWSClientFromEC2IMDS(ctx)
 	if err != nil {
@@ -129,26 +119,19 @@ func NewAWSSnapshotter(ctx context.Context, logger *zerolog.Logger, cfg *runsOnC
 		cfg.CustomTags = []runsOnConfig.Tag{}
 	}
 
-	// we're currently using GITHUB_REF_NAME, so refs/ is not present, but just in case
-	// https://docs.github.com/en/actions/writing-workflows/choosing-what-your-workflow-does/accessing-contextual-information-about-workflow-runs
 	sanitizedGithubRef := strings.TrimPrefix(cfg.GithubRef, "refs/")
 	sanitizedGithubRef = strings.ReplaceAll(sanitizedGithubRef, "/", "-")
 	if len(sanitizedGithubRef) > 40 {
 		sanitizedGithubRef = sanitizedGithubRef[:40]
 	}
 
-	sanitizedPath := sanitizePath(cfg.Path)
-	if len(sanitizedPath) > 30 {
-		sanitizedPath = sanitizedPath[:30]
-	}
-
 	currentTime := time.Now()
 	if cfg.SnapshotName == "" {
-		cfg.SnapshotName = fmt.Sprintf("runs-on-snapshot-%s-%s-%s", sanitizedPath, sanitizedGithubRef, currentTime.Format("20060102-150405"))
+		cfg.SnapshotName = fmt.Sprintf("runs-on-snapshot-%s-%s", sanitizedGithubRef, currentTime.Format("20060102-150405"))
 	}
 
 	if cfg.VolumeName == "" {
-		cfg.VolumeName = fmt.Sprintf("runs-on-volume-%s-%s-%s", sanitizedPath, sanitizedGithubRef, currentTime.Format("20060102-150405"))
+		cfg.VolumeName = fmt.Sprintf("runs-on-volume-%s-%s", sanitizedGithubRef, currentTime.Format("20060102-150405"))
 	}
 
 	return &AWSSnapshotter{
@@ -173,7 +156,7 @@ func (s *AWSSnapshotter) defaultTags() []types.Tag {
 		{Key: aws.String(snapshotTagKeyBranch), Value: aws.String(s.getSnapshotTagValue())},
 		{Key: aws.String(snapshotTagKeyArch), Value: aws.String(s.arch())},
 		{Key: aws.String(snapshotTagKeyPlatform), Value: aws.String(s.platform())},
-		{Key: aws.String(snapshotTagKeyPath), Value: aws.String(sanitizePath(s.config.Path))},
+		{Key: aws.String(snapshotTagKeyPath), Value: aws.String("_all_")},
 	}
 	for _, tag := range s.config.CustomTags {
 		tags = append(tags, types.Tag{Key: aws.String(tag.Key), Value: aws.String(tag.Value)})
@@ -181,11 +164,9 @@ func (s *AWSSnapshotter) defaultTags() []types.Tag {
 	return tags
 }
 
-// saveVolumeInfo writes volume information to a JSON file
 func (s *AWSSnapshotter) saveVolumeInfo(volumeInfo *VolumeInfo) error {
-	infoPath := getVolumeInfoPath(volumeInfo.MountPoint)
+	infoPath := getVolumeInfoPath()
 
-	// Create directory if it doesn't exist
 	if err := os.MkdirAll(filepath.Dir(infoPath), 0755); err != nil {
 		return fmt.Errorf("failed to create directory for volume info: %w", err)
 	}
@@ -202,9 +183,8 @@ func (s *AWSSnapshotter) saveVolumeInfo(volumeInfo *VolumeInfo) error {
 	return nil
 }
 
-// loadVolumeInfo reads volume information from a JSON file
-func (s *AWSSnapshotter) loadVolumeInfo(mountPoint string) (*VolumeInfo, error) {
-	infoPath := getVolumeInfoPath(mountPoint)
+func (s *AWSSnapshotter) loadVolumeInfo() (*VolumeInfo, error) {
+	infoPath := getVolumeInfoPath()
 	data, err := os.ReadFile(infoPath)
 	if err != nil {
 		return nil, fmt.Errorf("failed to read volume info file: %w", err)
@@ -219,15 +199,13 @@ func (s *AWSSnapshotter) loadVolumeInfo(mountPoint string) (*VolumeInfo, error) 
 }
 
 func (s *AWSSnapshotter) getSnapshotTagValue() string {
-	return fmt.Sprintf("%s", s.config.GithubRef)
+	return s.config.GithubRef
 }
 
 func (s *AWSSnapshotter) getSnapshotTagValueDefaultBranch() string {
-	return fmt.Sprintf("%s", s.config.RunnerConfig.DefaultBranch)
+	return s.config.RunnerConfig.DefaultBranch
 }
 
-// runCommand executes a shell command and returns its combined output or an error.
-// It now requires a context for potential cancellation if the command runs too long.
 func (s *AWSSnapshotter) runCommand(ctx context.Context, name string, arg ...string) ([]byte, error) {
 	cmd := exec.CommandContext(ctx, name, arg...)
 	s.logger.Info().Msgf("Executing command: %s %s", name, strings.Join(arg, " "))
@@ -236,7 +214,6 @@ func (s *AWSSnapshotter) runCommand(ctx context.Context, name string, arg ...str
 		s.logger.Warn().Msgf("Command failed: %s %s\nOutput:\n%s\nError: %v", name, strings.Join(arg, " "), string(output), err)
 		return output, fmt.Errorf("command '%s %s' failed: %s: %w", name, strings.Join(arg, " "), string(output), err)
 	}
-	// Limit log output size for potentially verbose commands
 	logOutput := string(output)
 	if len(logOutput) > 400 {
 		logOutput = logOutput[:200] + "... (output truncated)"
@@ -245,9 +222,6 @@ func (s *AWSSnapshotter) runCommand(ctx context.Context, name string, arg ...str
 	return output, nil
 }
 
-// getVolumeInfoPath returns the path to the volume info JSON file for a given mount point
-func getVolumeInfoPath(mountPoint string) string {
-	// Replace slashes with hyphens and remove leading/trailing hyphens
-	sanitizedPath := strings.Trim(strings.ReplaceAll(mountPoint, "/", "-"), "-")
-	return filepath.Join("/runs-on", fmt.Sprintf("snapshot-%s.json", sanitizedPath))
+func getVolumeInfoPath() string {
+	return filepath.Join("/runs-on", "snapshot.json")
 }
