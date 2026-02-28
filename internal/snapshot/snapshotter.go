@@ -169,13 +169,17 @@ func (s *AWSSnapshotter) volumeInfoPath() string {
 }
 
 func (s *AWSSnapshotter) defaultTags() []types.Tag {
+	pathValue := "_all_"
+	if s.config.Suffix != "" {
+		pathValue = "_all_-" + s.config.Suffix
+	}
 	tags := []types.Tag{
 		{Key: aws.String(snapshotTagKeyVersion), Value: aws.String(s.config.Version)},
 		{Key: aws.String(snapshotTagKeyRepository), Value: aws.String(s.config.GithubRepository)},
 		{Key: aws.String(snapshotTagKeyBranch), Value: aws.String(s.getSnapshotTagValue())},
 		{Key: aws.String(snapshotTagKeyArch), Value: aws.String(s.arch())},
 		{Key: aws.String(snapshotTagKeyPlatform), Value: aws.String(s.platform())},
-		{Key: aws.String(snapshotTagKeyPath), Value: aws.String("_all_")},
+		{Key: aws.String(snapshotTagKeyPath), Value: aws.String(pathValue)},
 		{Key: aws.String(snapshotTagKeySuffix), Value: aws.String(s.config.Suffix)},
 	}
 	for _, tag := range s.config.CustomTags {
